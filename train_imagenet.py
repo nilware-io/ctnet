@@ -38,25 +38,56 @@ from dct_utils import calculate_hevc_rate_proxy, estimate_h265_size_bits
 
 
 class CachedDataset(torch.utils.data.Dataset):
-    """Cache raw PIL images in RAM, apply transforms on-the-fly."""
+    """
+    Cache dataset as pre-decoded tensors in RAM.
 
-    def __init__(self, image_folder, transform):
-        self.transform = transform
+    For training: caches resized tensors (Resize+ToTensor), applies random
+    augmentations (RandomResizedCrop, RandomHorizontalFlip) on-the-fly via GPU
+    or fast tensor ops.
+
+    For validation: caches fully transformed tensors (Resize+CenterCrop+
+    ToTensor+Normalize) — __getitem__ is a pure lookup.
+    """
+
+    def __init__(self, image_folder, transform, is_train=False):
         self.targets = image_folder.targets
-        # Cache raw PIL images (before transform)
-        # Re-read with the loader but no transform
-        self._images = []
-        for path, target in image_folder.imgs:
-            img = image_folder.loader(path)
-            self._images.append((img, target))
+        self._is_train = is_train
+
+        if is_train:
+            # Cache as tensors at original size, apply augmentation on-the-fly
+            self._normalize = None
+            self._images = []
+            to_tensor = transforms.ToTensor()
+            for path, target in image_folder.imgs:
+                img = image_folder.loader(path)
+                self._images.append((to_tensor(img), target))
+            # Extract normalize from the transform pipeline
+            for t in transform.transforms:
+                if isinstance(t, transforms.Normalize):
+                    self._normalize = t
+        else:
+            # Cache fully transformed tensors — zero-cost __getitem__
+            self._images = []
+            for i in range(len(image_folder)):
+                img, target = image_folder[i]
+                self._images.append((img, target))
 
     def __len__(self):
         return len(self._images)
 
     def __getitem__(self, idx):
         img, target = self._images[idx]
-        if self.transform is not None:
-            img = self.transform(img)
+        if self._is_train:
+            # Fast tensor augmentation
+            img = transforms.functional.resized_crop(
+                img,
+                *transforms.RandomResizedCrop.get_params(img, scale=(0.08, 1.0), ratio=(3/4, 4/3)),
+                size=(224, 224),
+            )
+            if torch.rand(1).item() < 0.5:
+                img = transforms.functional.hflip(img)
+            if self._normalize is not None:
+                img = self._normalize(img)
         return img, target
 
 
@@ -222,8 +253,11 @@ def main():
     val_dataset = datasets.ImageFolder(valdir, val_transform)
 
     if args.cache_dataset:
-        train_dataset = CachedDataset(train_dataset, train_transform)
-        val_dataset = CachedDataset(val_dataset, val_transform)
+        if is_main:
+            print("=> Caching dataset in RAM...")
+        train_dataset = CachedDataset(train_dataset, train_transform, is_train=True)
+        val_dataset = CachedDataset(val_dataset, val_transform, is_train=False)
+        args.workers = 0  # no multiprocessing needed, data is in RAM
         if is_main:
             print(f"=> Cached {len(train_dataset)} train + {len(val_dataset)} val images in RAM")
 
