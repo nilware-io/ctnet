@@ -34,7 +34,7 @@ import torchvision.datasets as datasets
 import torchvision.models as models
 
 from dct_layers import DCTConv2d, replace_with_dct_convs, probe_sparsity, quantize_model, export_sparse_coefficients
-from dct_utils import calculate_hevc_rate_proxy
+from dct_utils import calculate_hevc_rate_proxy, estimate_h265_size_bits
 
 
 def parse_args():
@@ -242,24 +242,22 @@ def main():
             torch.save(state, path)
             if is_best:
                 torch.save(state, os.path.join(args.output_dir, "best.pth"))
-            # Compute estimated total network bits and compression ratio
-            est_bits = 0.0
-            raw_bytes = 0
-            with torch.no_grad():
-                for m in base_model.modules():
-                    if isinstance(m, DCTConv2d):
-                        est_bits += calculate_hevc_rate_proxy(
-                            m.weight_dct, qstep=args.qstep, steepness=args.steepness
-                        ).item()
-                        raw_bytes += m.weight_dct.numel() * 4  # float32
-            est_kb = est_bits / 8 / 1024
+            # Estimate H.265 compressed size at 8/10/12-bit
+            est_by_depth, raw_bytes = estimate_h265_size_bits(
+                base_model.named_modules(), bit_depths=(8, 10, 12)
+            )
             raw_kb = raw_bytes / 1024
-            ratio = raw_kb / max(est_kb, 1e-6)
+
+            est_parts = []
+            for b in (8, 10, 12):
+                kb = est_by_depth[b] / 8 / 1024
+                r = raw_kb / max(kb, 1e-6)
+                est_parts.append(f"{b}b:{kb:.0f}KB({r:.0f}x)")
+            est_str = "  ".join(est_parts)
 
             print(f"=> Epoch {epoch}: Acc@1 {acc1:.2f}%  (best: {best_acc1:.2f}%)  "
                   f"Sparsity {sparsity*100:.1f}% ({nonzero}/{total} nonzero)  "
-                  f"EstSize {est_kb:.1f} KB / {raw_kb:.1f} KB raw  "
-                  f"Ratio {ratio:.1f}x")
+                  f"Est[{est_str}] / {raw_kb:.0f}KB raw")
 
     # --- Post-training: quantize and export sparse coefficients ---
     if is_main:
@@ -329,6 +327,11 @@ def train_one_epoch(train_loader, model, criterion, optimizer, epoch, device, ar
         m.weight_dct.numel() * 4 for m in base_model.modules() if isinstance(m, DCTConv2d)
     ) / 1024
 
+    # Pre-compute size estimates for this epoch (used in batch logging)
+    est_by_depth, _ = estimate_h265_size_bits(
+        base_model.named_modules(), bit_depths=(8, 10, 12)
+    )
+
     for i, (images, targets) in enumerate(train_loader):
         data_time.update(time.time() - end)
 
@@ -369,15 +372,19 @@ def train_one_epoch(train_loader, model, criterion, optimizer, epoch, device, ar
         if i % args.print_freq == 0:
             rank = int(os.environ.get("RANK", 0))
             if rank == 0:
-                est_kb = rate_losses.val / 8 / 1024
-                ratio = raw_kb / max(est_kb, 1e-6)
+                est_parts = []
+                for b in (8, 10, 12):
+                    kb = est_by_depth[b] / 8 / 1024
+                    r = raw_kb / max(kb, 1e-6)
+                    est_parts.append(f"{b}b:{kb:.0f}KB({r:.0f}x)")
+                est_str = "  ".join(est_parts)
                 print(
                     f"Epoch [{epoch}][{i}/{len(train_loader)}]  "
                     f"Time {batch_time.val:.3f} ({batch_time.avg:.3f})  "
                     f"Data {data_time.val:.3f} ({data_time.avg:.3f})  "
                     f"TaskLoss {task_losses.val:.4f} ({task_losses.avg:.4f})  "
                     f"RateLoss {rate_losses.val:.1f} ({rate_losses.avg:.1f})  "
-                    f"EstSize {est_kb:.1f}/{raw_kb:.0f} KB ({ratio:.1f}x)  "
+                    f"Est[{est_str}]  "
                     f"Acc@1 {top1.val:.2f} ({top1.avg:.2f})  "
                     f"Acc@5 {top5.val:.2f} ({top5.avg:.2f})"
                 )
