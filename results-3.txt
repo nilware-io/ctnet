@@ -1,0 +1,104 @@
+```
+./train-ctnet-18.sh
+```
+
+@ 69 epochs
+
+Full model DCT weights (float32): 42948.8 KB
+Pixel frames raw:                 10737.6 KB
+H.265 encoded:                    4518.6 KB
+Compression vs float32:           9.5x
+Compression vs pixel raw:         2.4x
+
+Non-DCT weights:                  2782.3 KB
+Total compressed model:           7300.9 KB
+Total compression ratio:          6.3x
+Manifest saved to ./h265_out/manifest.json
+
+@ 84 epochs
+--- Summary (preset=slower, 46.5s) ---
+Full model DCT weights (float32): 42948.8 KB
+Pixel frames raw:                 10737.6 KB
+H.265 encoded:                    4272.1 KB
+Compression vs float32:           10.1x
+Compression vs pixel raw:         2.5x
+
+Non-DCT weights:                  2782.3 KB
+Total compressed model:           7054.5 KB
+Total compression ratio:          6.5x
+Manifest saved to ./h265_out/manifest.json
+
+
+@ 164 epochs
+--- Summary (preset=slower, 38.2s) ---
+Full model DCT weights (float32): 42948.8 KB
+Pixel frames raw:                 10737.6 KB
+H.265 encoded:                    2685.8 KB
+Compression vs float32:           16.0x
+Compression vs pixel raw:         4.0x
+
+Non-DCT weights:                  2782.3 KB
+Total compressed model:           5468.2 KB
+Total compression ratio:          8.4x
+Manifest saved to ./h265_out/manifest.json
+
+@ 176 epochs
+--- Summary (preset=slower, 37.5s) ---
+Full model DCT weights (float32): 42948.8 KB
+Pixel frames raw:                 10737.6 KB
+H.265 encoded:                    2334.8 KB
+Compression vs float32:           18.4x
+Compression vs pixel raw:         4.6x
+
+Non-DCT weights:                  2782.3 KB
+Total compressed model:           5117.2 KB
+Total compression ratio:          8.9x
+Manifest saved to ./h265_out/manifest.json
+
+@ 256 (best)
+--- Summary (preset=slower, 27.6s) ---
+Full model DCT weights (float32): 42948.8 KB
+Pixel frames raw:                 10737.6 KB
+H.265 encoded:                    1719.3 KB
+Compression vs float32:           25.0x
+Compression vs pixel raw:         6.2x
+
+Non-DCT weights:                  2782.3 KB
+Total compressed model:           4501.6 KB
+Total compression ratio:          10.2x
+Manifest saved to ./h265_out/manifest.json
+
+--- Decoded Model Evaluation ---
+  Loss:  0.3172
+  Acc@1: 92.31%
+  Acc@5: 99.44%
+  (After H.265 decode: Acc@1 92.31%)
+
+  H.265 total size:    1719.3 KB
+  Float32 model size:  42948.8 KB
+  Compression ratio:   25.0x
+
+
+  @256 (last)
+
+  --- Summary (preset=slower, 21.8s) ---
+Full model DCT weights (float32): 42948.8 KB
+Pixel frames raw:                 10737.6 KB
+H.265 encoded:                    1157.7 KB
+Compression vs float32:           37.1x
+Compression vs pixel raw:         9.3x
+
+Non-DCT weights:                  2782.3 KB
+Total compressed model:           3940.1 KB
+Total compression ratio:          11.6x
+Manifest saved to ./h265_out/manifest.json
+
+--- Decoded Model Evaluation ---
+  Loss:  0.3325
+  Acc@1: 92.13%
+  Acc@5: 99.36%
+  (After H.265 decode: Acc@1 92.13%)
+
+  H.265 total size:    1157.7 KB
+  Float32 model size:  42948.8 KB
+  Compression ratio:   37.1x
