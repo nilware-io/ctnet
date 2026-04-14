@@ -33,7 +33,7 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
 
-from dct_layers import DCTConv2d, replace_with_dct_convs, probe_sparsity, quantize_model, export_sparse_coefficients
+from dct_layers import DCTConv2d, ChannelDCTConv1x1, _is_dct_layer, replace_with_dct_convs, probe_sparsity, quantize_model, export_sparse_coefficients
 from dct_utils import calculate_hevc_rate_proxy, estimate_h265_size_bits
 
 
@@ -164,9 +164,10 @@ def main():
     model = model.to(device)
 
     if is_main:
-        n_dct = sum(1 for m in model.modules() if isinstance(m, DCTConv2d))
+        n_spatial = sum(1 for m in model.modules() if isinstance(m, DCTConv2d))
+        n_channel = sum(1 for m in model.modules() if isinstance(m, ChannelDCTConv1x1))
         n_conv = sum(1 for m in model.modules() if isinstance(m, nn.Conv2d))
-        print(f"=> Replaced convolutions: {n_dct} DCTConv2d, {n_conv} standard Conv2d remaining (1x1)")
+        print(f"=> Replaced: {n_spatial} DCTConv2d (spatial), {n_channel} ChannelDCTConv1x1 (1x1), {n_conv} standard Conv2d remaining")
 
     if distributed:
         model = nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
@@ -425,7 +426,7 @@ def train_one_epoch(train_loader, model, criterion, optimizer, epoch, device, ar
 
     # Raw weight size (float32) for compression ratio
     raw_kb = sum(
-        m.weight_dct.numel() * 4 for m in base_model.modules() if isinstance(m, DCTConv2d)
+        m.weight_dct.numel() * 4 for m in base_model.modules() if _is_dct_layer(m)
     ) / 1024
 
     # Pre-compute size estimates for this epoch (used in batch logging)
@@ -446,7 +447,7 @@ def train_one_epoch(train_loader, model, criterion, optimizer, epoch, device, ar
         # HEVC rate proxy: differentiable estimate of compressed size
         rate_loss = torch.tensor(0.0, device=device)
         for m in base_model.modules():
-            if isinstance(m, DCTConv2d):
+            if _is_dct_layer(m):
                 rate_loss = rate_loss + calculate_hevc_rate_proxy(
                     m.weight_dct, qstep=args.qstep, steepness=args.steepness
                 )

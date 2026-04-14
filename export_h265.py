@@ -33,7 +33,7 @@ import torchvision.models as models
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 
-from dct_layers import DCTConv2d, replace_with_dct_convs
+from dct_layers import DCTConv2d, ChannelDCTConv1x1, _is_dct_layer, replace_with_dct_convs
 
 
 def parse_args():
@@ -71,14 +71,11 @@ def parse_args():
                      help="path to ImageNet/ImageNette dataset for evaluation")
     dec.add_argument("-b", "--batch-size", default=256, type=int)
     dec.add_argument("-j", "--workers", default=4, type=int)
-    dec.add_argument("--non-dct-weights", default=None,
-                     help="checkpoint to load non-DCT weights from (default: "
-                          "non_dct_weights.pt in h265-dir, falls back to best.pth)")
 
     return p.parse_args()
 
 
-MIN_DIM = 8
+MIN_DIM = 16  # libx265 minimum frame dimension
 MAX_TILE = 128
 
 
@@ -362,14 +359,9 @@ def denormalize_frames(pixels: list[np.ndarray],
     return results
 
 
-def reassemble_layer(tiles: list[dict]) -> torch.Tensor:
-    """
-    Reassemble decoded tile frames into a 4D DCT weight tensor.
-    Frame values are float weights (from denormalize_frames).
-    Returns: (out_ch, in_ch, K_h, K_w) float32 tensor.
-    """
+def _reassemble_2d(tiles: list[dict]) -> torch.Tensor:
+    """Reassemble decoded tiles into a 2D tensor at orig_shape dimensions."""
     first = tiles[0]
-    out_ch, in_ch, K_h, K_w = first["orig_shape"]
     img_h, img_w = first["img_shape"]
 
     img = np.zeros((img_h, img_w), dtype=np.float64)
@@ -385,9 +377,20 @@ def reassemble_layer(tiles: list[dict]) -> torch.Tensor:
         src_h, src_w = row_end - row_start, col_end - col_start
         img[row_start:row_end, col_start:col_end] = t["frame"][:src_h, :src_w]
 
-    tensor_2d = torch.from_numpy(img.astype(np.float32))
-    weight = tensor_2d.reshape(out_ch, K_h, in_ch, K_w).permute(0, 2, 1, 3).contiguous()
-    return weight
+    return torch.from_numpy(img.astype(np.float32))
+
+
+def reassemble_spatial_dct(tiles: list[dict]) -> torch.Tensor:
+    """Reassemble tiles into a 4D spatial DCT weight (out, in, K_h, K_w)."""
+    first = tiles[0]
+    out_ch, in_ch, K_h, K_w = first["orig_shape"]
+    tensor_2d = _reassemble_2d(tiles)
+    return tensor_2d.reshape(out_ch, K_h, in_ch, K_w).permute(0, 2, 1, 3).contiguous()
+
+
+def reassemble_2d(tiles: list[dict]) -> torch.Tensor:
+    """Reassemble tiles into a 2D tensor (channel_dct, fc, fc_bias, bn)."""
+    return _reassemble_2d(tiles)
 
 
 def _sort_by_similarity(entries: list[dict]) -> list[dict]:
@@ -459,8 +462,8 @@ def decode_main(args):
         for fi, finfo in enumerate(vinfo["frames"]):
             layer_name = finfo["layer_name"]
             if layer_name not in layer_tiles:
-                layer_tiles[layer_name] = []
-            layer_tiles[layer_name].append({
+                layer_tiles[layer_name] = {"tiles": [], "layer_type": finfo.get("layer_type", "spatial_dct")}
+            layer_tiles[layer_name]["tiles"].append({
                 "frame": values[fi],
                 "orig_shape": tuple(finfo["orig_shape"]),
                 "img_shape": tuple(finfo["img_shape"]),
@@ -470,65 +473,42 @@ def decode_main(args):
                 "n_tile_cols": finfo["n_tile_cols"],
             })
 
-    # Build model and load non-DCT weights (bn, fc, 1x1 convs)
+    # Build model — all weights will come from H.265 data
     model_fn = getattr(models, arch)
     model = model_fn(weights=None)
     replace_with_dct_convs(model)
 
-    # Resolve non-DCT weights path
-    non_dct_path = args.non_dct_weights
-    if non_dct_path is None:
-        # Look in h265 dir first, then fall back to checkpoints/best.pth
-        bundled = os.path.join(args.h265_dir, "non_dct_weights.pt")
-        if os.path.isfile(bundled):
-            non_dct_path = bundled
-        elif os.path.isfile("./checkpoints/best.pth"):
-            non_dct_path = "./checkpoints/best.pth"
-
-    state = None
-    if non_dct_path and os.path.isfile(non_dct_path):
-        print(f"  Loading non-DCT weights from {non_dct_path}")
-        loaded = torch.load(non_dct_path, map_location="cpu", weights_only=False)
-        # Handle both full checkpoint (has "state_dict" key) and bare state dict
-        if isinstance(loaded, dict) and "state_dict" in loaded:
-            state = loaded["state_dict"]
-        else:
-            state = loaded
-        if any(k.startswith("module.") for k in state):
-            state = {k.removeprefix("module."): v for k, v in state.items()}
-        model_state = model.state_dict()
-        dct_keys = set()
-        for name, m in model.named_modules():
-            if isinstance(m, DCTConv2d):
-                dct_keys.add(f"{name}.weight_dct")
-                if m.bias is not None:
-                    dct_keys.add(f"{name}.bias")
-        for k, v in state.items():
-            if k not in dct_keys and k in model_state:
-                model_state[k] = v
-        model.load_state_dict(model_state)
-    else:
-        print(f"  WARNING: no non-DCT weights found")
-        print(f"           BN/FC/1x1 layers will be random — accuracy will be meaningless")
-
-    # Reassemble DCT weights from decoded tiles
+    # Reassemble ALL weights from decoded tiles
     for name, m in model.named_modules():
         if isinstance(m, DCTConv2d) and name in layer_tiles:
-            weight = reassemble_layer(layer_tiles[name])
+            weight = reassemble_spatial_dct(layer_tiles[name]["tiles"])
             m.weight_dct.data.copy_(weight)
-            print(f"  Loaded {name}: {list(weight.shape)}  "
-                  f"range=[{weight.min():.4f}, {weight.max():.4f}]")
-        elif isinstance(m, DCTConv2d):
-            m.weight_dct.data.zero_()
-            print(f"  Zeroed {name}: not in H.265 data")
+            print(f"  Loaded {name} (spatial_dct): {list(weight.shape)}")
 
-    # Load DCT-layer biases from non-DCT weights if present
-    if state is not None:
-        for name, m in model.named_modules():
-            if isinstance(m, DCTConv2d) and m.bias is not None:
-                bias_key = f"{name}.bias"
-                if bias_key in state:
-                    m.bias.data.copy_(state[bias_key])
+        elif isinstance(m, ChannelDCTConv1x1) and name in layer_tiles:
+            weight = reassemble_2d(layer_tiles[name]["tiles"])
+            m.weight_dct.data.copy_(weight)
+            print(f"  Loaded {name} (channel_dct): {list(weight.shape)}")
+
+        elif isinstance(m, nn.BatchNorm2d) and name in layer_tiles:
+            img = reassemble_2d(layer_tiles[name]["tiles"])
+            m.weight.data.copy_(img[0])
+            m.bias.data.copy_(img[1])
+            m.running_mean.copy_(img[2])
+            m.running_var.copy_(img[3])
+            print(f"  Loaded {name} (bn): {list(img.shape)}")
+
+        elif isinstance(m, nn.Linear):
+            wkey = name + ".weight"
+            bkey = name + ".bias"
+            if wkey in layer_tiles:
+                weight = reassemble_2d(layer_tiles[wkey]["tiles"])
+                m.weight.data.copy_(weight)
+                print(f"  Loaded {wkey} (fc): {list(weight.shape)}")
+            if bkey in layer_tiles and m.bias is not None:
+                bias = reassemble_2d(layer_tiles[bkey]["tiles"])
+                m.bias.data.copy_(bias.squeeze(0))
+                print(f"  Loaded {bkey} (fc_bias): {list(bias.shape)}")
 
     # Evaluate
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -605,8 +585,65 @@ PROFILE_PRESETS = [
 ]
 
 
+def _module_to_2d(name, m):
+    """
+    Convert any module's parameters to a list of (2D image, metadata) entries.
+    Returns list of dicts with keys: name, img, orig_shape, img_shape, layer_type.
+    """
+    entries = []
+
+    if isinstance(m, DCTConv2d):
+        img = layer_to_2d(m.weight_dct)
+        entries.append({
+            "name": name, "img": img,
+            "orig_shape": list(m.weight_dct.shape),
+            "img_shape": list(img.shape),
+            "layer_type": "spatial_dct",
+        })
+
+    elif isinstance(m, ChannelDCTConv1x1):
+        img = m.weight_dct.detach().float().numpy()  # already 2D
+        entries.append({
+            "name": name, "img": img,
+            "orig_shape": list(m.weight_dct.shape),
+            "img_shape": list(img.shape),
+            "layer_type": "channel_dct",
+        })
+
+    elif isinstance(m, nn.BatchNorm2d):
+        # Stack [weight, bias, running_mean, running_var] as [4, features]
+        img = torch.stack([
+            m.weight.data, m.bias.data, m.running_mean, m.running_var
+        ], dim=0).float().numpy()
+        entries.append({
+            "name": name, "img": img,
+            "orig_shape": [4, m.num_features],
+            "img_shape": list(img.shape),
+            "layer_type": "bn",
+        })
+
+    elif isinstance(m, nn.Linear):
+        img = m.weight.detach().float().numpy()
+        entries.append({
+            "name": name + ".weight", "img": img,
+            "orig_shape": list(m.weight.shape),
+            "img_shape": list(img.shape),
+            "layer_type": "fc",
+        })
+        if m.bias is not None:
+            bias_img = m.bias.detach().float().unsqueeze(0).numpy()
+            entries.append({
+                "name": name + ".bias", "img": bias_img,
+                "orig_shape": [1, m.bias.shape[0]],
+                "img_shape": list(bias_img.shape),
+                "layer_type": "fc_bias",
+            })
+
+    return entries
+
+
 def _load_model_for_encode(args):
-    """Load model and prepare tile groups."""
+    """Load model and prepare tile groups for ALL layers."""
     model_fn = getattr(models, args.arch)
     model = model_fn(weights=None)
     replace_with_dct_convs(model)
@@ -621,21 +658,18 @@ def _load_model_for_encode(args):
         state = {k.removeprefix("module."): v for k, v in state.items()}
     model.load_state_dict(state)
 
-    # Convert each layer to 2D float image
+    # Convert ALL layers to 2D float images
     layer_images = []
+    full_model_bytes = 0
+
     for name, m in model.named_modules():
-        if isinstance(m, DCTConv2d):
-            img = layer_to_2d(m.weight_dct)
-            out_ch, in_ch, K_h, K_w = m.weight_dct.shape
-            layer_images.append({
-                "name": name, "img": img,
-                "orig_shape": (out_ch, in_ch, K_h, K_w),
-                "img_shape": img.shape,
-            })
-            nnz = np.count_nonzero(img)
-            print(f"  {name}: weight {list(m.weight_dct.shape)} -> "
-                  f"2D {img.shape[0]}x{img.shape[1]}  "
-                  f"nnz={nnz}/{img.size}")
+        entries = _module_to_2d(name, m)
+        for e in entries:
+            layer_images.append(e)
+            full_model_bytes += e["img"].size * 4  # float32
+            print(f"  {e['name']}: {e['orig_shape']} -> "
+                  f"2D {e['img_shape'][0]}x{e['img_shape'][1]}  "
+                  f"({e['layer_type']})")
 
     # Build tiles, group by dimensions
     tile_groups = {}
@@ -654,6 +688,7 @@ def _load_model_for_encode(args):
                 "layer_name": li["name"],
                 "orig_shape": li["orig_shape"],
                 "img_shape": li["img_shape"],
+                "layer_type": li["layer_type"],
                 "tile_row": 0, "tile_col": 0,
                 "n_tile_rows": 1, "n_tile_cols": 1,
             })
@@ -676,14 +711,10 @@ def _load_model_for_encode(args):
                     "layer_name": li["name"],
                     "orig_shape": li["orig_shape"],
                     "img_shape": li["img_shape"],
+                    "layer_type": li["layer_type"],
                     "tile_row": row_idx, "tile_col": col_idx,
                     "n_tile_rows": n_tile_rows, "n_tile_cols": n_tile_cols,
                 })
-
-    full_model_bytes = sum(
-        m.weight_dct.numel() * 4
-        for m in model.modules() if isinstance(m, DCTConv2d)
-    )
 
     return model, tile_groups, full_model_bytes
 
@@ -734,6 +765,7 @@ def _encode_tile_groups(tile_groups: dict, output_dir: str, crf: int,
                 manifest_videos[video_name]["frames"].append({
                     "frame_index": i,
                     "layer_name": e["layer_name"],
+                    "layer_type": e["layer_type"],
                     "orig_shape": list(e["orig_shape"]),
                     "img_shape": list(e["img_shape"]),
                     "tile_row": e["tile_row"],
@@ -825,33 +857,8 @@ def encode_main(args):
         "h265_encoded_bytes": total_h265_bytes,
     }
 
-    # Save non-DCT weights (BN, FC, 1x1 convs) so the h265 dir is self-contained
-    non_dct_state = {}
-    dct_keys = set()
-    for name, m in model.named_modules():
-        if isinstance(m, DCTConv2d):
-            dct_keys.add(f"{name}.weight_dct")
-            if m.bias is not None:
-                dct_keys.add(f"{name}.bias")
-            # Also exclude IDCT buffers
-            dct_keys.add(f"{name}.C_h_T")
-            dct_keys.add(f"{name}.C_w")
-
-    for k, v in model.state_dict().items():
-        if k not in dct_keys:
-            non_dct_state[k] = v
-
-    non_dct_path = os.path.join(args.output_dir, "non_dct_weights.pt")
-    torch.save(non_dct_state, non_dct_path)
-    non_dct_bytes = os.path.getsize(non_dct_path)
-    total_compressed = total_h265_bytes + non_dct_bytes
-
-    print(f"\nNon-DCT weights:                  {non_dct_bytes/1024:.1f} KB")
-    print(f"Total compressed model:           {total_compressed/1024:.1f} KB")
-    print(f"Total compression ratio:          {(full_model_bytes + non_dct_bytes) / max(total_compressed, 1):.1f}x")
-
-    manifest["summary"]["non_dct_weights_bytes"] = non_dct_bytes
-    manifest["summary"]["total_compressed_bytes"] = total_compressed
+    print(f"\nTotal compressed model (H.265 only): {total_h265_bytes/1024:.1f} KB")
+    print(f"Compression ratio:                   {full_model_bytes/max(total_h265_bytes,1):.1f}x")
 
     manifest_path = os.path.join(args.output_dir, "manifest.json")
     with open(manifest_path, "w") as f:

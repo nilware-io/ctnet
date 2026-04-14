@@ -235,13 +235,15 @@ The following table compares CTNet against established neural network compressio
 
 ## 5. Related Work
 
+**DCT-Conv: Coding filters with Discrete Cosine Transform (Checinski & Wawrzynski, 2020).** The most directly relevant prior work. Checinski & Wawrzynski proposed DCT-Conv layers where convolutional filters are defined by their DCT coefficients rather than spatial weights, with IDCT applied to recover spatial filters during the forward pass. They demonstrated on ResNet-50/CIFAR-100 that 99.9% of 3x3 DCT coefficients can be switched off while maintaining good performance — the network effectively learns to use only a few frequency components per filter. Their key finding validates our core premise: neural network weights are highly compressible in the DCT domain. CTNet extends this work in three significant ways: (1) we add a differentiable rate proxy that optimizes *for* compressibility during training rather than post-hoc coefficient removal, (2) we use a production video codec (H.265) as the compression backend rather than simple coefficient zeroing, and (3) we extend DCT reparameterization beyond spatial convolutions to 1x1 pointwise convolutions via channel-wise DCT and to all other layer types (BN, FC) via center+normalize encoding.
+
+**ECRF: Entropy-Constrained Neural Radiance Fields (Lee et al., 2023).** Lee et al. applied DCT-domain compression with entropy optimization to Neural Radiance Fields (NeRF), achieving state-of-the-art compression on TensoRF feature grids. Their approach shares several key ideas with CTNet: (1) transforming parameters to the frequency domain via DCT, (2) training with an entropy-based loss to encourage compressible representations, and (3) post-training quantization to 8-bit followed by entropy coding. They also use additive uniform noise as a differentiable proxy for quantization during training — similar to our dither mechanism. A crucial insight from ECRF is that jointly optimizing the entropy of transformed coefficients with the task loss (in their case, rendering quality) produces significantly sparser frequency-domain representations than training without entropy awareness. Their pipeline (DCT → 8-bit quantization → arithmetic coding) parallels CTNet's pipeline (DCT → center+normalize → H.265 CABAC), but we replace custom arithmetic coding with a standard video codec, gaining hardware decoder support at the cost of some compression efficiency.
+
 **Weight pruning.** Unstructured pruning (Han et al., 2015) removes individual weights by magnitude, achieving 9-13x compression on AlexNet/VGG. The Lottery Ticket Hypothesis (Frankle & Carlin, 2019) shows that sparse subnetworks can be trained from scratch, but finding tickets requires iterative pruning-retraining cycles. Structured pruning (He et al., 2017; Lin et al., 2020) removes entire filters or channels for hardware-friendly speedups but typically achieves lower compression ratios (1.5-2x on ResNet-18).
 
 **Quantization.** Reducing weight precision from 32-bit floating point to 8-bit integers gives 4x compression with negligible accuracy loss (Jacob et al., 2018). More aggressive quantization to 4 bits (Esser et al., 2020) or 2 bits degrades accuracy significantly on small models like ResNet-18. Binary networks (Rastegari et al., 2016; Liu et al., 2020) achieve 32x compression but with 4-18% accuracy drops.
 
 **Deep Compression.** Han et al. (2016) pipeline pruning, quantization (to 5-8 bits with codebook), and Huffman entropy coding to achieve 35-49x on AlexNet/VGG. This remains the gold standard for maximum compression, but requires custom decompression code and benefits disproportionately from large fully-connected layers absent in modern architectures.
-
-**Transform-domain approaches.** Several works have explored frequency-domain representations for neural networks. Wang et al. (2016) proposed learning in the frequency domain, and Chen et al. (2016) used hashing for weight compression. However, to our knowledge, no prior work has directly used a production video codec as the compression backend for neural network weights.
 
 **Learned image compression.** The learned compression literature (Balle et al., 2017; Minnen et al., 2018) has developed differentiable rate-distortion optimization for image codecs. Our rate proxy draws inspiration from this work, adapting it to the specific structure of neural network coefficient maps.
 
@@ -307,6 +309,7 @@ Future work includes evaluation on full ImageNet-1K, combination with structured
 ## References
 
 - Balle, J., Laparra, V., & Simoncelli, E. P. (2017). End-to-end optimized image compression. ICLR.
+- Checinski, K., & Wawrzynski, P. (2020). DCT-Conv: Coding filters in convolutional networks with Discrete Cosine Transform. arXiv:2001.08517.
 - Dong, Z., Yao, Z., Gholami, A., Mahoney, M. W., & Keutzer, K. (2020). HAWQ-V2: Hessian aware trace-weighted quantization of neural networks. NeurIPS.
 - Esser, S. K., McKinstry, J. L., Bablani, D., Appuswamy, R., & Modha, D. S. (2020). Learned step size quantization. ICLR.
 - Frankle, J., & Carlin, M. (2019). The lottery ticket hypothesis: Finding sparse, trainable networks. ICLR.
@@ -319,6 +322,7 @@ Future work includes evaluation on full ImageNet-1K, combination with structured
 - Hinton, G., Vinyals, O., & Dean, J. (2015). Distilling the knowledge in a neural network. arXiv:1503.02531.
 - Howard, A., et al. (2019). Searching for MobileNetV3. ICCV.
 - Jacob, B., et al. (2018). Quantization and training of neural networks for efficient integer-arithmetic-only inference. CVPR.
+- Lee, S., Shu, F., Sanchez, Y., Schierl, T., & Hellge, C. (2023). ECRF: Entropy-constrained neural radiance fields compression with frequency domain optimization. arXiv:2311.14208.
 - Lin, M., et al. (2020). HRank: Filter pruning using high-rank feature map. CVPR.
 - Liu, Z., Shen, Z., Savvides, M., & Cheng, K. T. (2020). ReActNet: Towards precise binary neural network with generalized activation functions. ECCV.
 - Luo, J., Wu, J., & Lin, W. (2017). ThiNet: A filter level pruning method for deep neural network compression. ICCV.

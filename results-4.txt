@@ -1,0 +1,85 @@
+```
+./train-ctnet-18.sh
+```
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+@ 32 epochs
+--- Summary (preset=slower, 56.3s) ---
+Full model DCT weights (float32): 45699.7 KB
+Pixel frames raw:                 11500.4 KB
+H.265 encoded:                    6250.0 KB
+Compression vs float32:           7.3x
+Compression vs pixel raw:         1.8x
+
+Total compressed model (H.265 only): 6250.0 KB
+Compression ratio:                   7.3x
+Manifest saved to ./h265_out/manifest.json
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+=> Epoch 68: Acc@1 80.59%  (best: 85.99%)  Sparsity 100.0% (862/11166912 nonzero)  Est[8b:5268KB(9x)  10b:8293KB(6x)  12b:11437KB(4x)] / 45700KB raw *smallest*
+Epoch [69][0/37]  Time 1.684 (1.684)  Data 1.496 (1.496)  TaskLoss 0.5068 (0.5068)  RateLoss 417509.1 (417509.1)  Est[8b:5268KB(8x)  10b:8293KB(5x)  12b:11437KB(4x)]  Acc@1 82.81 (82.81)  Acc@5 98.05 (98.05)
+
+--- Summary (preset=slower, 52.9s) ---
+Full model DCT weights (float32): 45699.7 KB
+Pixel frames raw:                 11500.4 KB
+H.265 encoded:                    5389.3 KB
+Compression vs float32:           8.5x
+Compression vs pixel raw:         2.1x
+
+Total compressed model (H.265 only): 5389.3 KB
+Compression ratio:                   8.5x
+Manifest saved to ./h265_out/manifest.json
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+=> Epoch 94: Acc@1 80.84%  (best: 87.03%)  Sparsity 100.0% (849/11166912 nonzero)  Est[8b:4709KB(10x)  10b:7600KB(6x)  12b:10671KB(4x)] / 45700KB raw *smallest*
+Epoch [95][0/37]  Time 1.686 (1.686)  Data 1.498 (1.498)  TaskLoss 0.3888 (0.3888)  RateLoss 412569.0 (412569.0)  Est[8b:4709KB(9x)  10b:7600KB(6x)  12b:10671KB(4x)]  Acc@1 87.50 (87.50)  Acc@5 98.83 (98.83)
+  * Val:  Loss 0.5996  Acc@1 82.70  Acc@5 98.45
+
+--- Summary (preset=slower, 54.3s) ---
+Full model DCT weights (float32): 45699.7 KB
+Pixel frames raw:                 11500.4 KB
+H.265 encoded:                    4643.8 KB
+Compression vs float32:           9.8x
+Compression vs pixel raw:         2.5x
+
+Total compressed model (H.265 only): 4643.8 KB
+Compression ratio:                   9.8x
+Manifest saved to ./h265_out/manifest.json
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+=> Epoch 104: Acc@1 86.93%  (best: 87.03%)  Sparsity 100.0% (849/11166912 nonzero)  Est[8b:4590KB(10x)  10b:7509KB(6x)  12b:10594KB(4x)] / 45700KB raw *smallest*
+Epoch [105][0/37]  Time 1.634 (1.634)  Data 1.442 (1.442)  TaskLoss 0.3419 (0.3419)  RateLoss 410984.6 (410984.6)  Est[8b:4590KB(10x)  10b:7509KB(6x)  12b:10594KB(4x)]  Acc@1 89.45 (89.45)  Acc@5 99.22 (99.22)
+  * Val:  Loss 0.4848  Acc@1 86.22  Acc@5 98.96
+
+  --- Summary (preset=slower, 49.6s) ---
+Full model DCT weights (float32): 45699.7 KB
+Pixel frames raw:                 11500.4 KB
+H.265 encoded:                    4565.8 KB
+Compression vs float32:           10.0x
+Compression vs pixel raw:         2.5x
+
+Total compressed model (H.265 only): 4565.8 KB
+Compression ratio:                   10.0x
+Manifest saved to ./h265_out/manifest.json
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+=> Epoch ~139: Acc@1 87.87%  (best: 90.06%)  Sparsity 100.0% (718/11166912 nonzero)  Est[8b:4045KB(11x)  10b:6685KB(7x)  12b:9615KB(5x)] / 45700KB raw *smallest*
+Epoch [140][0/37]  Time 1.765 (1.765)  Data 1.584 (1.584)  TaskLoss 0.2979 (0.2979)  RateLoss 403137.6 (403137.6)  Est[8b:4045KB(11x)  10b:6685KB(7x)  12b:9615KB(5x)]  Acc@1 90.23 (90.23)  Acc@5 100.00 (100.00)
+
+--- Summary (preset=slower, 48.8s, crf 30) ---
+Full model DCT weights (float32): 45699.7 KB
+Pixel frames raw:                 11500.4 KB
+H.265 encoded:                    588.2 KB
+Compression vs float32:           77.7x
+Compression vs pixel raw:         19.6x
+
+Total compressed model (H.265 only): 588.2 KB
+Compression ratio:                   77.7x
+Manifest saved to ./h265_out/manifest.json
