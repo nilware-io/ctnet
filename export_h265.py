@@ -85,7 +85,7 @@ def parse_args():
                      help="path to ImageNet/ImageNette dataset for evaluation")
     dec.add_argument("-b", "--batch-size", default=256, type=int)
     dec.add_argument("-j", "--workers", default=4, type=int)
-    dec.add_argument("--non-dct-weights", default="./checkpoints/quantized.pth",
+    dec.add_argument("--non-dct-weights", default="./checkpoints/best.pth",
                      help="checkpoint to load non-DCT weights from (fc, bn, 1x1 convs)")
 
     return p.parse_args()
