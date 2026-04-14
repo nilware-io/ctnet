@@ -1,29 +1,24 @@
 """
-Export sparse DCT coefficients as H.265-encoded video files, and decode
-them back for evaluation.
+Export DCT coefficients as H.265-encoded video files, and decode them back
+for evaluation.
 
 Each DCT layer's coefficients (out_ch, in_ch, K_h, K_w) are reshaped into a
-2D image of (out_ch * K_h, in_ch * K_w) quantized levels.  Layers whose 2D
-images share the same tile dimensions are grouped into a single video (one
-frame per layer).  Images larger than 128x128 are sliced into multiple
-128x128 tiles (each tile becomes a separate frame).
+2D image of (out_ch * K_h, in_ch * K_w).  Layers whose 2D images share the
+same tile dimensions are grouped into a single video (one frame per layer).
+Images larger than 128x128 are sliced into tiles; smaller than 8x8 are
+circularly padded.
 
-Constraints for H.265 validity:
-  - Minimum frame size: 8x8
-  - Maximum tile size: 128x128
-  - Padding uses circular repetition of the data
-
-Pixel format: gray16le or gray (8-bit).  Signed levels are stored with a
-per-video center and norm_factor recorded in manifest.json.
+Float coefficients are stored via per-frame center+normalization to N-bit
+pixel range.  The center and norm_factor are recorded in manifest.json for
+exact reconstruction.
 
 Usage:
   Encode:
-    python export_h265.py encode [--quantized-model ...] [--output-dir h265_out]
-                                 [--qstep 0.1] [--crf 0] [--arch resnet18]
+    python export_h265.py encode [--model best.pth] [--output-dir h265_out]
+                                 [--crf 0] [--arch resnet18]
 
   Decode & evaluate:
     python export_h265.py decode [--h265-dir h265_out] [--data ./imagenette2-320]
-                                 [--batch-size 256] [--workers 4]
 """
 
 import argparse
@@ -47,35 +42,26 @@ def parse_args():
 
     # --- encode subcommand ---
     enc = sub.add_parser("encode", help="Encode DCT coefficients to H.265")
-    enc.add_argument("--input", default="./checkpoints/sparse_coefficients.pt",
-                     help="path to sparse_coefficients.pt")
-    enc.add_argument("--quantized-model", default="./checkpoints/quantized.pth",
-                     help="path to quantized.pth (for full dense coefficient export)")
+    enc.add_argument("--model", default="./checkpoints/best.pth",
+                     help="path to model checkpoint (default: best.pth)")
     enc.add_argument("--output-dir", default="./h265_out", help="output directory")
-    enc.add_argument("--qstep", default=0.1, type=float,
-                     help="quantization step (must match training)")
     enc.add_argument("--arch", default="resnet18",
                      choices=["resnet18", "resnet34", "resnet50", "resnet101"])
     enc.add_argument("--crf", default=0, type=int,
                      help="H.265 CRF (0 = lossless, higher = more compression)")
-    enc.add_argument("--bit-depth", default=12, type=int, choices=[8, 10, 12],
-                     help="pixel bit depth for encoding (default: 12, max supported by libx265)")
+    enc.add_argument("--bit-depth", default=8, type=int, choices=[8, 10, 12],
+                     help="pixel bit depth for encoding (default: 8)")
     enc.add_argument("--preset", default="medium",
                      choices=["ultrafast", "superfast", "veryfast", "faster",
                               "fast", "medium", "slow", "slower", "veryslow"],
                      help="x265 encoding preset (default: medium)")
     enc.add_argument("--profile", action="store_true",
                      help="encode with every preset from ultrafast to veryslow and compare")
-    enc.add_argument("--quantize", action="store_true",
-                     help="quantize to integer levels before encoding "
-                          "(default: encode raw float coefficients via center+normalization)")
     enc.add_argument("--dither", default=0.0, type=float,
-                     help="subtractive dither amplitude in quantization-step units "
-                          "(0 = off, 0.5 = standard TPDF-like dither)")
+                     help="subtractive dither amplitude (0 = off, 0.5 = standard)")
     enc.add_argument("--yuv", action="store_true",
                      help="encode as YUV 4:2:0 (Main/Main10 profile) for hardware "
-                          "decoder compatibility on phones, Mac, Windows, etc. "
-                          "Data goes in luma channel only.")
+                          "decoder compatibility on phones, Mac, Windows, etc.")
 
     # --- decode subcommand ---
     dec = sub.add_parser("decode", help="Decode H.265 back to model and evaluate")
@@ -85,8 +71,9 @@ def parse_args():
                      help="path to ImageNet/ImageNette dataset for evaluation")
     dec.add_argument("-b", "--batch-size", default=256, type=int)
     dec.add_argument("-j", "--workers", default=4, type=int)
-    dec.add_argument("--non-dct-weights", default="./checkpoints/best.pth",
-                     help="checkpoint to load non-DCT weights from (fc, bn, 1x1 convs)")
+    dec.add_argument("--non-dct-weights", default=None,
+                     help="checkpoint to load non-DCT weights from (default: "
+                          "non_dct_weights.pt in h265-dir, falls back to best.pth)")
 
     return p.parse_args()
 
@@ -95,20 +82,13 @@ MIN_DIM = 8
 MAX_TILE = 128
 
 
-def layer_to_2d(weight_dct: torch.Tensor, qstep: float,
-                quantize: bool = True) -> np.ndarray:
+def layer_to_2d(weight_dct: torch.Tensor) -> np.ndarray:
     """
-    Convert a 4D DCT weight tensor to a 2D image.
+    Convert a 4D DCT weight tensor to a 2D float32 image.
     Shape: (out_ch, in_ch, K_h, K_w) -> (out_ch * K_h, in_ch * K_w)
-
-    If quantize=True: returns int16 quantized levels (round(w / qstep)).
-    If quantize=False: returns float32 raw coefficients (no quantization loss).
     """
     out_ch, in_ch, K_h, K_w = weight_dct.shape
-    if quantize:
-        data = torch.round(weight_dct / qstep).to(torch.int16)
-    else:
-        data = weight_dct.detach().float()
+    data = weight_dct.detach().float()
     img = data.permute(0, 2, 1, 3).reshape(out_ch * K_h, in_ch * K_w)
     return img.numpy()
 
@@ -153,11 +133,9 @@ def slice_to_tiles(img: np.ndarray, tile_h: int, tile_w: int):
         for c in range(0, w, tile_w):
             cc = min(tile_w, w - c)
             tile = img[r:r+rr, c:c+cc]
-            # Pad undersized tiles circularly
             if rr < MIN_DIM or cc < MIN_DIM:
                 tile = pad_to_min(tile)
             elif rr < tile_h or cc < tile_w:
-                # Pad partial edge tiles to full tile size circularly
                 tile = circular_pad(tile, max(rr, MIN_DIM), max(cc, MIN_DIM))
             tiles.append((tile, row_idx, col_idx))
             col_idx += 1
@@ -165,15 +143,11 @@ def slice_to_tiles(img: np.ndarray, tile_h: int, tile_w: int):
     return tiles
 
 
-DITHER_BASE_SEED = 0xDC7C0EFF  # deterministic seed for reproducible dither
+DITHER_BASE_SEED = 0xDC7C0EFF
 
 
 def _dither_noise(shape: tuple, frame_index: int, amplitude: float) -> np.ndarray:
-    """
-    Generate deterministic white noise in [-amplitude, +amplitude) for
-    subtractive dither.  Same seed + frame_index → same noise on encode
-    and decode.
-    """
+    """Deterministic white noise in [-amplitude, +amplitude) for subtractive dither."""
     rng = np.random.default_rng(DITHER_BASE_SEED + frame_index)
     return rng.uniform(-amplitude, amplitude, size=shape)
 
@@ -181,16 +155,10 @@ def _dither_noise(shape: tuple, frame_index: int, amplitude: float) -> np.ndarra
 def normalize_frame(frame: np.ndarray, bit_depth: int = 12,
                     frame_index: int = 0, dither: float = 0.0):
     """
-    Normalize a single frame to unsigned integer range [0, 2^bit_depth - 1].
+    Normalize a single frame to unsigned integer range [0, 2^bit_depth - 1]
+    using center+scale.  Optionally adds subtractive dither before rounding.
 
-    If dither > 0, adds deterministic white noise of the given amplitude
-    (in quantization-step units) before rounding.  The same noise is
-    subtracted on decode, reducing correlated quantization error.
-
-    Returns:
-        pixels: uint8 or uint16 array
-        center: float, the center value of the original data
-        norm_factor: float, scale factor
+    Returns: (pixels, center, norm_factor)
     """
     max_val = (1 << bit_depth) - 1
     half = max_val / 2.0
@@ -200,15 +168,10 @@ def normalize_frame(frame: np.ndarray, bit_depth: int = 12,
     center = (fmin + fmax) / 2.0
 
     span = fmax - fmin
-    if span == 0:
-        norm_factor = 1.0
-    else:
-        norm_factor = max_val / span
+    norm_factor = max_val / span if span > 0 else 1.0
 
-    # Map to continuous pixel space
     p = (frame.astype(np.float64) - center) * norm_factor + half
 
-    # Add subtractive dither noise before rounding
     if dither > 0:
         p = p + _dither_noise(p.shape, frame_index, amplitude=dither)
 
@@ -219,7 +182,7 @@ def normalize_frame(frame: np.ndarray, bit_depth: int = 12,
 
 
 def _pad_to_even(frames_list: list[np.ndarray]) -> tuple[list[np.ndarray], int, int]:
-    """Pad frames to even dimensions (required for YUV 4:2:0 chroma subsampling)."""
+    """Pad frames to even dimensions (required for YUV 4:2:0)."""
     h, w = frames_list[0].shape
     new_h = h + (h % 2)
     new_w = w + (w % 2)
@@ -229,7 +192,6 @@ def _pad_to_even(frames_list: list[np.ndarray]) -> tuple[list[np.ndarray], int, 
     for f in frames_list:
         p = np.zeros((new_h, new_w), dtype=f.dtype)
         p[:h, :w] = f
-        # Circular pad the extra row/col
         if new_h > h:
             p[h, :w] = f[0, :]
             if new_w > w:
@@ -241,15 +203,9 @@ def _pad_to_even(frames_list: list[np.ndarray]) -> tuple[list[np.ndarray], int, 
 
 
 def _gray_to_yuv420(frame: np.ndarray, bit_depth: int) -> bytes:
-    """
-    Convert a grayscale frame to YUV 4:2:0 planar format.
-    Luma (Y) = the data. Chroma (U, V) = neutral gray (2^(bit_depth-1)).
-    """
+    """Convert grayscale frame to YUV 4:2:0 planar. Luma = data, chroma = neutral."""
     h, w = frame.shape
-    assert h % 2 == 0 and w % 2 == 0, "YUV 4:2:0 requires even dimensions"
-
-    chroma_h = h // 2
-    chroma_w = w // 2
+    chroma_h, chroma_w = h // 2, w // 2
     neutral = 1 << (bit_depth - 1)
 
     if bit_depth == 8:
@@ -259,37 +215,24 @@ def _gray_to_yuv420(frame: np.ndarray, bit_depth: int) -> bytes:
         y_plane = frame.astype(np.uint16).tobytes()
         uv_val = np.full((chroma_h, chroma_w), neutral, dtype=np.uint16)
 
-    u_plane = uv_val.tobytes()
-    v_plane = uv_val.tobytes()
-
-    return y_plane + u_plane + v_plane
+    return y_plane + uv_val.tobytes() + uv_val.tobytes()
 
 
 def encode_frames_to_h265(frames: list[np.ndarray], output_path: str,
-                          crf: int = 0, preset: str = "veryslow",
+                          crf: int = 0, preset: str = "medium",
                           bit_depth: int = 12, dither: float = 0.0,
                           yuv: bool = False):
     """
-    Normalize (per-frame) and encode a list of 2D numpy arrays as an H.265 video.
+    Normalize (per-frame center+scale) and encode as H.265 video.
 
-    Each frame gets its own center and norm_factor so that layers with
-    different value ranges don't lose precision.
-
-    If yuv=True, encodes as YUV 4:2:0 (Main/Main10 profile) for hardware
-    decoder compatibility. Data is placed in the luma channel; chroma is
-    neutral gray.
-
-    Returns:
-        (success, per_frame_norms) or (False, []) on failure.
-        per_frame_norms is a list of {"center": float, "norm_factor": float}.
+    Returns: (success, per_frame_norms) or (False, []) on failure.
     """
     h, w = frames[0].shape
     assert all(f.shape == (h, w) for f in frames), "All frames must have same dimensions"
 
     # YUV 4:2:0 only supports 8 and 10 bit
     if yuv and bit_depth not in (8, 10):
-        print(f"  WARNING: --yuv forces bit-depth to 10 (was {bit_depth}). "
-              f"Main10 profile supports up to 10-bit.")
+        print(f"  WARNING: --yuv forces bit-depth to 10 (was {bit_depth}).")
         bit_depth = 10
 
     # Normalize each frame independently
@@ -302,69 +245,50 @@ def encode_frames_to_h265(frames: list[np.ndarray], output_path: str,
         per_frame_norms.append({"center": center, "norm_factor": norm_factor})
 
     if yuv:
-        # Pad to even dimensions for 4:2:0 chroma subsampling
         pixels, enc_h, enc_w = _pad_to_even(pixels)
-
         if bit_depth == 8:
-            in_pix_fmt = "yuv420p"
-            out_pix_fmt = "yuv420p"
-            h265_profile = "main"
+            in_pix_fmt, out_pix_fmt, h265_profile = "yuv420p", "yuv420p", "main"
         else:
-            in_pix_fmt = "yuv420p10le"
-            out_pix_fmt = "yuv420p10le"
-            h265_profile = "main10"
+            in_pix_fmt, out_pix_fmt, h265_profile = "yuv420p10le", "yuv420p10le", "main10"
 
-        # x265 params: full range
         x265_params = "log-level=error:range=full"
         if crf == 0:
             x265_params += ":lossless=1"
 
         cmd = [
             "ffmpeg", "-y",
-            "-f", "rawvideo",
-            "-pixel_format", in_pix_fmt,
-            "-video_size", f"{enc_w}x{enc_h}",
-            "-framerate", "1",
+            "-f", "rawvideo", "-pixel_format", in_pix_fmt,
+            "-video_size", f"{enc_w}x{enc_h}", "-framerate", "1",
             "-i", "pipe:",
-            "-c:v", "libx265",
-            "-preset", preset,
-            "-pix_fmt", out_pix_fmt,
-            "-profile:v", h265_profile,
-            "-x265-params", x265_params,
-            "-color_range", "pc",
+            "-c:v", "libx265", "-preset", preset,
+            "-pix_fmt", out_pix_fmt, "-profile:v", h265_profile,
+            "-x265-params", x265_params, "-color_range", "pc",
         ]
         if crf > 0:
             cmd += ["-crf", str(crf)]
         cmd.append(output_path)
-
         raw_data = b"".join(_gray_to_yuv420(p, bit_depth) for p in pixels)
     else:
         enc_h, enc_w = h, w
         pix_fmt_map = {8: "gray", 10: "gray10le", 12: "gray12le"}
         pix_fmt = pix_fmt_map[bit_depth]
 
-        # x265 params: full range, lossless if CRF=0
         x265_params = "log-level=error:range=full"
         if crf == 0:
             x265_params += ":lossless=1"
 
         cmd = [
             "ffmpeg", "-y",
-            "-f", "rawvideo",
-            "-pixel_format", pix_fmt,
-            "-video_size", f"{enc_w}x{enc_h}",
-            "-framerate", "1",
+            "-f", "rawvideo", "-pixel_format", pix_fmt,
+            "-video_size", f"{enc_w}x{enc_h}", "-framerate", "1",
             "-i", "pipe:",
-            "-c:v", "libx265",
-            "-preset", preset,
+            "-c:v", "libx265", "-preset", preset,
             "-pix_fmt", pix_fmt,
-            "-x265-params", x265_params,
-            "-color_range", "pc",
+            "-x265-params", x265_params, "-color_range", "pc",
         ]
         if crf > 0:
             cmd += ["-crf", str(crf)]
         cmd.append(output_path)
-
         raw_data = b"".join(p.tobytes() for p in pixels)
 
     proc = subprocess.run(cmd, input=raw_data, capture_output=True)
@@ -377,17 +301,12 @@ def encode_frames_to_h265(frames: list[np.ndarray], output_path: str,
 
 def decode_h265_frames(video_path: str, n_frames: int, width: int, height: int,
                        bit_depth: int = 12, yuv: bool = False) -> list[np.ndarray]:
-    """
-    Decode an H.265 video back to a list of 2D numpy arrays (luma pixels).
-    If yuv=True, decodes as YUV 4:2:0 and extracts just the Y plane.
-    """
+    """Decode H.265 video back to a list of 2D numpy arrays (luma pixels)."""
     dtype = np.uint8 if bit_depth == 8 else np.uint16
     bpp = 1 if bit_depth == 8 else 2
 
     if yuv:
         pix_fmt = "yuv420p" if bit_depth == 8 else "yuv420p10le"
-        # YUV 4:2:0: Y = w*h, U = w/2*h/2, V = w/2*h/2
-        # Total = w*h * 1.5 (in samples)
         y_samples = width * height
         uv_samples = (width // 2) * (height // 2)
         frame_bytes = (y_samples + 2 * uv_samples) * bpp
@@ -396,13 +315,8 @@ def decode_h265_frames(video_path: str, n_frames: int, width: int, height: int,
         pix_fmt = pix_fmt_map.get(bit_depth, "gray12le")
         frame_bytes = width * height * bpp
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", video_path,
-        "-f", "rawvideo",
-        "-pixel_format", pix_fmt,
-        "pipe:",
-    ]
+    cmd = ["ffmpeg", "-y", "-i", video_path,
+           "-f", "rawvideo", "-pixel_format", pix_fmt, "pipe:"]
 
     proc = subprocess.run(cmd, capture_output=True)
     if proc.returncode != 0:
@@ -413,10 +327,7 @@ def decode_h265_frames(video_path: str, n_frames: int, width: int, height: int,
     if len(raw) != expected:
         raise RuntimeError(
             f"Decoded size mismatch for {video_path}: "
-            f"got {len(raw)} bytes, expected {expected} "
-            f"({n_frames} frames x {width}x{height}, "
-            f"{'yuv420' if yuv else 'gray'} {bit_depth}bit)"
-        )
+            f"got {len(raw)} bytes, expected {expected}")
 
     frames = []
     y_bytes = width * height * bpp
@@ -431,14 +342,10 @@ def decode_h265_frames(video_path: str, n_frames: int, width: int, height: int,
 def denormalize_frames(pixels: list[np.ndarray],
                        per_frame_norms: list[dict],
                        bit_depth: int = 12,
-                       quantized: bool = True,
                        dither: float = 0.0) -> list[np.ndarray]:
     """
-    Convert pixel values back to original values using per-frame center/norm.
-    If dither > 0, subtracts the same noise that was added during encoding.
-
-    If quantized: rounds to int16 (integer levels).
-    If not quantized: returns float64 (raw weight values).
+    Convert pixel values back to float weights using per-frame center/norm.
+    Inverse: weight = (pixel - max_val/2) / norm_factor + center
     """
     max_val = (1 << bit_depth) - 1
     half = max_val / 2.0
@@ -451,55 +358,71 @@ def denormalize_frames(pixels: list[np.ndarray],
         if dither > 0:
             p_f = p_f - _dither_noise(p.shape, frame_index=i, amplitude=dither)
         val = (p_f - half) / norm_factor + center
-        if quantized:
-            val = np.round(val).astype(np.int16)
         results.append(val)
     return results
 
 
-def reassemble_layer(tiles: list[dict], qstep: float,
-                     quantized: bool = True) -> torch.Tensor:
+def reassemble_layer(tiles: list[dict]) -> torch.Tensor:
     """
-    Reassemble a list of decoded tile frames into a 4D DCT weight tensor.
-
-    Each tile dict has: frame (np.ndarray of levels/values), orig_shape,
-    img_shape, tile_row, tile_col, n_tile_rows, n_tile_cols.
-
-    If quantized: frame values are integer levels, multiply by qstep.
-    If not quantized: frame values are already float weights.
-
+    Reassemble decoded tile frames into a 4D DCT weight tensor.
+    Frame values are float weights (from denormalize_frames).
     Returns: (out_ch, in_ch, K_h, K_w) float32 tensor.
     """
     first = tiles[0]
     out_ch, in_ch, K_h, K_w = first["orig_shape"]
     img_h, img_w = first["img_shape"]
 
-    # Reconstruct full 2D image
-    dtype = np.int16 if quantized else np.float64
-    img = np.zeros((img_h, img_w), dtype=dtype)
+    img = np.zeros((img_h, img_w), dtype=np.float64)
 
     tile_h = tiles[0]["frame"].shape[0]
     tile_w = tiles[0]["frame"].shape[1]
 
     for t in tiles:
-        r = t["tile_row"]
-        c = t["tile_col"]
-        row_start = r * tile_h
-        col_start = c * tile_w
-        # Crop to actual image bounds (discard circular padding)
+        r, c = t["tile_row"], t["tile_col"]
+        row_start, col_start = r * tile_h, c * tile_w
         row_end = min(row_start + tile_h, img_h)
         col_end = min(col_start + tile_w, img_w)
-        src_h = row_end - row_start
-        src_w = col_end - col_start
+        src_h, src_w = row_end - row_start, col_end - col_start
         img[row_start:row_end, col_start:col_end] = t["frame"][:src_h, :src_w]
 
-    # Reshape back: (out_ch*K_h, in_ch*K_w) -> (out_ch, K_h, in_ch, K_w) -> (out_ch, in_ch, K_h, K_w)
     tensor_2d = torch.from_numpy(img.astype(np.float32))
-    if quantized:
-        tensor_2d = tensor_2d * qstep
     weight = tensor_2d.reshape(out_ch, K_h, in_ch, K_w).permute(0, 2, 1, 3).contiguous()
     return weight
 
+
+def _sort_by_similarity(entries: list[dict]) -> list[dict]:
+    """
+    Sort frames by similarity using greedy nearest-neighbor ordering.
+    Places similar frames adjacent for better H.265 inter-frame prediction.
+    """
+    if len(entries) <= 2:
+        return entries
+
+    flat = [e["frame"].astype(np.float32).ravel() for e in entries]
+    n = len(entries)
+    visited = [False] * n
+    order = [0]
+    visited[0] = True
+
+    for _ in range(n - 1):
+        last = order[-1]
+        best_idx, best_dist = -1, float("inf")
+        last_flat = flat[last]
+        for j in range(n):
+            if visited[j]:
+                continue
+            diff = last_flat - flat[j]
+            dist = np.dot(diff, diff) / len(diff)
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = j
+        order.append(best_idx)
+        visited[best_idx] = True
+
+    return [entries[i] for i in order]
+
+
+# ---------- Decode ----------
 
 def decode_main(args):
     """Decode H.265 videos back to model weights, load into model, evaluate."""
@@ -507,48 +430,38 @@ def decode_main(args):
     with open(manifest_path) as f:
         manifest = json.load(f)
 
-    qstep = manifest["qstep"]
     arch = manifest["arch"]
     bit_depth = manifest["bit_depth"]
-    was_quantized = manifest.get("quantized", True)
     dither = manifest.get("dither", 0.0)
     use_yuv = manifest.get("yuv", False)
 
-    mode_str = "quantized (int levels)" if was_quantized else "float (center+norm)"
     dither_str = f", dither={dither}" if dither > 0 else ""
     yuv_str = ", yuv420" if use_yuv else ""
-    print(f"Decoding H.265 model: arch={arch}, qstep={qstep}, "
-          f"bit_depth={bit_depth}, mode={mode_str}{dither_str}{yuv_str}")
+    print(f"Decoding H.265 model: arch={arch}, bit_depth={bit_depth}{dither_str}{yuv_str}")
 
-    # Decode all videos and denormalize back to levels/values
-    layer_tiles = {}  # layer_name -> list of tile dicts
+    # Decode all videos and denormalize back to float weights
+    layer_tiles = {}
 
     for video_name, vinfo in manifest["videos"].items():
         video_path = os.path.join(args.h265_dir, video_name)
-        w = vinfo["frame_width"]
-        h = vinfo["frame_height"]
-        n = vinfo["n_frames"]
+        w, h, n = vinfo["frame_width"], vinfo["frame_height"], vinfo["n_frames"]
         vbit = vinfo.get("bit_depth", bit_depth)
 
-        # Build per-frame norms from manifest
-        per_frame_norms = []
-        for finfo in vinfo["frames"]:
-            per_frame_norms.append({
-                "center": finfo["center"],
-                "norm_factor": finfo["norm_factor"],
-            })
+        per_frame_norms = [
+            {"center": f["center"], "norm_factor": f["norm_factor"]}
+            for f in vinfo["frames"]
+        ]
 
         print(f"  Decoding {video_name}: {n} frames @ {w}x{h}...")
         pixels = decode_h265_frames(video_path, n, w, h, vbit, yuv=use_yuv)
-        levels = denormalize_frames(pixels, per_frame_norms, vbit,
-                                    quantized=was_quantized, dither=dither)
+        values = denormalize_frames(pixels, per_frame_norms, vbit, dither=dither)
 
         for fi, finfo in enumerate(vinfo["frames"]):
             layer_name = finfo["layer_name"]
             if layer_name not in layer_tiles:
                 layer_tiles[layer_name] = []
             layer_tiles[layer_name].append({
-                "frame": levels[fi],
+                "frame": values[fi],
                 "orig_shape": tuple(finfo["orig_shape"]),
                 "img_shape": tuple(finfo["img_shape"]),
                 "tile_row": finfo["tile_row"],
@@ -557,18 +470,32 @@ def decode_main(args):
                 "n_tile_cols": finfo["n_tile_cols"],
             })
 
-    # Build model and load non-DCT weights
+    # Build model and load non-DCT weights (bn, fc, 1x1 convs)
     model_fn = getattr(models, arch)
     model = model_fn(weights=None)
     replace_with_dct_convs(model)
 
-    if os.path.isfile(args.non_dct_weights):
-        print(f"  Loading non-DCT weights from {args.non_dct_weights}")
-        ckpt = torch.load(args.non_dct_weights, map_location="cpu", weights_only=False)
-        state = ckpt["state_dict"]
+    # Resolve non-DCT weights path
+    non_dct_path = args.non_dct_weights
+    if non_dct_path is None:
+        # Look in h265 dir first, then fall back to checkpoints/best.pth
+        bundled = os.path.join(args.h265_dir, "non_dct_weights.pt")
+        if os.path.isfile(bundled):
+            non_dct_path = bundled
+        elif os.path.isfile("./checkpoints/best.pth"):
+            non_dct_path = "./checkpoints/best.pth"
+
+    state = None
+    if non_dct_path and os.path.isfile(non_dct_path):
+        print(f"  Loading non-DCT weights from {non_dct_path}")
+        loaded = torch.load(non_dct_path, map_location="cpu", weights_only=False)
+        # Handle both full checkpoint (has "state_dict" key) and bare state dict
+        if isinstance(loaded, dict) and "state_dict" in loaded:
+            state = loaded["state_dict"]
+        else:
+            state = loaded
         if any(k.startswith("module.") for k in state):
             state = {k.removeprefix("module."): v for k, v in state.items()}
-        # Load only non-DCT weights (bn, fc, 1x1 convs)
         model_state = model.state_dict()
         dct_keys = set()
         for name, m in model.named_modules():
@@ -581,24 +508,22 @@ def decode_main(args):
                 model_state[k] = v
         model.load_state_dict(model_state)
     else:
-        print(f"  WARNING: no non-DCT weights found at {args.non_dct_weights}")
+        print(f"  WARNING: no non-DCT weights found")
         print(f"           BN/FC/1x1 layers will be random — accuracy will be meaningless")
 
     # Reassemble DCT weights from decoded tiles
     for name, m in model.named_modules():
         if isinstance(m, DCTConv2d) and name in layer_tiles:
-            weight = reassemble_layer(layer_tiles[name], qstep,
-                                     quantized=was_quantized)
+            weight = reassemble_layer(layer_tiles[name])
             m.weight_dct.data.copy_(weight)
-            nnz = (torch.round(weight / qstep) != 0).sum().item()
-            print(f"  Loaded {name}: {list(weight.shape)}  nnz={nnz}/{weight.numel()}")
+            print(f"  Loaded {name}: {list(weight.shape)}  "
+                  f"range=[{weight.min():.4f}, {weight.max():.4f}]")
         elif isinstance(m, DCTConv2d):
-            # Layer not in H.265 data — zero it out
             m.weight_dct.data.zero_()
             print(f"  Zeroed {name}: not in H.265 data")
 
-    # Load DCT-layer biases from checkpoint if available
-    if os.path.isfile(args.non_dct_weights):
+    # Load DCT-layer biases from non-DCT weights if present
+    if state is not None:
         for name, m in model.named_modules():
             if isinstance(m, DCTConv2d) and m.bias is not None:
                 bias_key = f"{name}.bias"
@@ -611,43 +536,33 @@ def decode_main(args):
     model.eval()
 
     valdir = os.path.join(args.data, "val")
-    normalize = transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225],
-    )
     val_dataset = datasets.ImageFolder(
         valdir,
         transforms.Compose([
             transforms.Resize(256),
             transforms.CenterCrop(224),
             transforms.ToTensor(),
-            normalize,
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225]),
         ]),
     )
     val_loader = torch.utils.data.DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.workers,
-        pin_memory=True,
+        val_dataset, batch_size=args.batch_size,
+        shuffle=False, num_workers=args.workers, pin_memory=True,
     )
 
     criterion = nn.CrossEntropyLoss().to(device)
 
     print(f"\nEvaluating decoded model on {valdir}...")
-    top1_sum = 0.0
-    top5_sum = 0.0
-    loss_sum = 0.0
+    top1_sum = top5_sum = loss_sum = 0.0
     total = 0
 
     with torch.no_grad():
         for images, targets in val_loader:
             images = images.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
-
             outputs = model(images)
             loss = criterion(outputs, targets)
-
             batch_size = targets.size(0)
             _, pred = outputs.topk(5, 1, True, True)
             pred = pred.t()
@@ -666,16 +581,9 @@ def decode_main(args):
     print(f"  Acc@1: {acc1:.2f}%")
     print(f"  Acc@5: {acc5:.2f}%")
 
-    # Compare with pre-quantization if available
-    if os.path.isfile(args.non_dct_weights):
-        ckpt = torch.load(args.non_dct_weights, map_location="cpu", weights_only=False)
-        if "acc1_before_quant" in ckpt:
-            print(f"\n  (Before quantization: Acc@1 {ckpt['acc1_before_quant']:.2f}%)")
-        if "acc1_after_quant" in ckpt:
-            print(f"  (After quantization, before H.265: Acc@1 {ckpt['acc1_after_quant']:.2f}%)")
-        print(f"  (After H.265 decode: Acc@1 {acc1:.2f}%)")
+    print(f"  (After H.265 decode: Acc@1 {acc1:.2f}%)")
 
-    # Total H.265 file size
+    # Sizes
     total_h265 = sum(
         os.path.getsize(os.path.join(args.h265_dir, vn))
         for vn in manifest["videos"]
@@ -689,6 +597,8 @@ def decode_main(args):
     print(f"  Compression ratio:   {full_model_bytes/max(total_h265,1):.1f}x")
 
 
+# ---------- Encode ----------
+
 PROFILE_PRESETS = [
     "ultrafast", "superfast", "veryfast", "faster",
     "fast", "medium", "slow", "slower", "veryslow",
@@ -696,76 +606,39 @@ PROFILE_PRESETS = [
 
 
 def _load_model_for_encode(args):
-    """Load model and prepare tile groups. Shared by encode and profile."""
+    """Load model and prepare tile groups."""
     model_fn = getattr(models, args.arch)
     model = model_fn(weights=None)
     replace_with_dct_convs(model)
 
-    do_quantize = getattr(args, "quantize", False)
+    if not os.path.isfile(args.model):
+        raise FileNotFoundError(f"No model found at {args.model}")
 
-    # When not quantizing, prefer best.pth (unquantized) over quantized.pth
-    if not do_quantize:
-        best_path = os.path.join(os.path.dirname(args.quantized_model), "best.pth")
-        if os.path.isfile(best_path):
-            print(f"Loading unquantized model from {best_path} (--no-quantize)")
-            ckpt = torch.load(best_path, map_location="cpu", weights_only=False)
-            state = ckpt["state_dict"]
-            if any(k.startswith("module.") for k in state):
-                state = {k.removeprefix("module."): v for k, v in state.items()}
-            model.load_state_dict(state)
-        elif os.path.isfile(args.quantized_model):
-            print(f"WARNING: best.pth not found, using {args.quantized_model}")
-            print(f"         Weights may already be quantized.")
-            ckpt = torch.load(args.quantized_model, map_location="cpu", weights_only=False)
-            state = ckpt["state_dict"]
-            if any(k.startswith("module.") for k in state):
-                state = {k.removeprefix("module."): v for k, v in state.items()}
-            model.load_state_dict(state)
-        else:
-            raise FileNotFoundError(f"No model found (tried best.pth and {args.quantized_model})")
-    elif os.path.isfile(args.quantized_model):
-        print(f"Loading quantized model from {args.quantized_model}")
-        ckpt = torch.load(args.quantized_model, map_location="cpu", weights_only=False)
-        state = ckpt["state_dict"]
-        if any(k.startswith("module.") for k in state):
-            state = {k.removeprefix("module."): v for k, v in state.items()}
-        model.load_state_dict(state)
-    elif os.path.isfile(args.input):
-        print(f"Loading sparse coefficients from {args.input}")
-        sparse_data = torch.load(args.input, map_location="cpu", weights_only=False)
-        for name, m in model.named_modules():
-            if isinstance(m, DCTConv2d) and name in sparse_data:
-                m.weight_dct.data.zero_()
-                indices = sparse_data[name]["indices"]
-                values = sparse_data[name]["values"].to(torch.float32)
-                if indices.numel() > 0:
-                    for idx, val in zip(indices, values):
-                        m.weight_dct.data[idx[0], idx[1], idx[2], idx[3]] = val * args.qstep
-    else:
-        raise FileNotFoundError(f"Neither {args.quantized_model} nor {args.input} found")
+    print(f"Loading model from {args.model}")
+    ckpt = torch.load(args.model, map_location="cpu", weights_only=False)
+    state = ckpt["state_dict"]
+    if any(k.startswith("module.") for k in state):
+        state = {k.removeprefix("module."): v for k, v in state.items()}
+    model.load_state_dict(state)
 
-    # Convert each layer to 2D image
+    # Convert each layer to 2D float image
     layer_images = []
     for name, m in model.named_modules():
         if isinstance(m, DCTConv2d):
-            img = layer_to_2d(m.weight_dct, args.qstep, quantize=do_quantize)
+            img = layer_to_2d(m.weight_dct)
             out_ch, in_ch, K_h, K_w = m.weight_dct.shape
             layer_images.append({
-                "name": name,
-                "img": img,
+                "name": name, "img": img,
                 "orig_shape": (out_ch, in_ch, K_h, K_w),
                 "img_shape": img.shape,
             })
             nnz = np.count_nonzero(img)
-            mode = "int16 quantized" if do_quantize else "float32"
             print(f"  {name}: weight {list(m.weight_dct.shape)} -> "
                   f"2D {img.shape[0]}x{img.shape[1]}  "
-                  f"nnz={nnz}/{img.size}  ({mode})")
+                  f"nnz={nnz}/{img.size}")
 
-    # Build tiles from each layer, group by tile dimensions
+    # Build tiles, group by dimensions
     tile_groups = {}
-    frame_metadata = {}  # same structure but without the numpy frame data
-
     for li in layer_images:
         img = li["img"]
         h, w = img.shape
@@ -781,10 +654,8 @@ def _load_model_for_encode(args):
                 "layer_name": li["name"],
                 "orig_shape": li["orig_shape"],
                 "img_shape": li["img_shape"],
-                "tile_row": 0,
-                "tile_col": 0,
-                "n_tile_rows": 1,
-                "n_tile_cols": 1,
+                "tile_row": 0, "tile_col": 0,
+                "n_tile_rows": 1, "n_tile_cols": 1,
             })
         else:
             n_tile_rows = (h + MAX_TILE - 1) // MAX_TILE
@@ -805,10 +676,8 @@ def _load_model_for_encode(args):
                     "layer_name": li["name"],
                     "orig_shape": li["orig_shape"],
                     "img_shape": li["img_shape"],
-                    "tile_row": row_idx,
-                    "tile_col": col_idx,
-                    "n_tile_rows": n_tile_rows,
-                    "n_tile_cols": n_tile_cols,
+                    "tile_row": row_idx, "tile_col": col_idx,
+                    "n_tile_rows": n_tile_rows, "n_tile_cols": n_tile_cols,
                 })
 
     full_model_bytes = sum(
@@ -816,16 +685,13 @@ def _load_model_for_encode(args):
         for m in model.modules() if isinstance(m, DCTConv2d)
     )
 
-    return model, tile_groups, full_model_bytes, do_quantize
+    return model, tile_groups, full_model_bytes
 
 
 def _encode_tile_groups(tile_groups: dict, output_dir: str, crf: int,
                         preset: str, bit_depth: int, dither: float = 0.0,
                         yuv: bool = False, verbose: bool = True):
-    """
-    Encode all tile groups to H.265 videos under output_dir.
-    Returns (total_raw_bytes, total_h265_bytes, manifest_videos dict).
-    """
+    """Encode all tile groups to H.265 videos."""
     import time as _time
 
     total_raw_bytes = 0
@@ -836,6 +702,9 @@ def _encode_tile_groups(tile_groups: dict, output_dir: str, crf: int,
     for (th, tw), entries in sorted(tile_groups.items()):
         video_name = f"dct_{th}x{tw}.hevc"
         video_path = os.path.join(output_dir, video_name)
+
+        # Sort frames by similarity for better inter-frame prediction
+        entries = _sort_by_similarity(entries)
 
         frames = [e["frame"] for e in entries]
         raw_bytes = sum(f.size * (bit_depth // 8) for f in frames)
@@ -857,14 +726,12 @@ def _encode_tile_groups(tile_groups: dict, output_dir: str, crf: int,
             total_h265_bytes += h265_bytes
 
             manifest_videos[video_name] = {
-                "frame_width": tw,
-                "frame_height": th,
-                "bit_depth": bit_depth,
-                "n_frames": len(frames),
+                "frame_width": tw, "frame_height": th,
+                "bit_depth": bit_depth, "n_frames": len(frames),
                 "frames": [],
             }
             for i, e in enumerate(entries):
-                frame_entry = {
+                manifest_videos[video_name]["frames"].append({
                     "frame_index": i,
                     "layer_name": e["layer_name"],
                     "orig_shape": list(e["orig_shape"]),
@@ -875,8 +742,7 @@ def _encode_tile_groups(tile_groups: dict, output_dir: str, crf: int,
                     "n_tile_cols": e["n_tile_cols"],
                     "center": per_frame_norms[i]["center"],
                     "norm_factor": per_frame_norms[i]["norm_factor"],
-                }
-                manifest_videos[video_name]["frames"].append(frame_entry)
+                })
 
     elapsed = _time.monotonic() - t0
     return total_raw_bytes, total_h265_bytes, manifest_videos, elapsed
@@ -886,10 +752,9 @@ def encode_main(args):
     """Encode DCT coefficients to H.265 videos."""
     os.makedirs(args.output_dir, exist_ok=True)
 
-    model, tile_groups, full_model_bytes, do_quantize = _load_model_for_encode(args)
+    model, tile_groups, full_model_bytes = _load_model_for_encode(args)
 
     if args.profile:
-        # Profile mode: encode with every preset and compare
         print(f"\n{'='*70}")
         print(f"PROFILE MODE: encoding with all presets (CRF={args.crf}, {args.bit_depth}-bit)")
         print(f"{'='*70}")
@@ -907,10 +772,8 @@ def encode_main(args):
             ratio_f32 = full_model_bytes / max(total_h265, 1)
             ratio_raw = total_raw / max(total_h265, 1)
             results.append({
-                "preset": preset,
-                "h265_bytes": total_h265,
-                "time_s": elapsed,
-                "ratio_vs_f32": ratio_f32,
+                "preset": preset, "h265_bytes": total_h265,
+                "time_s": elapsed, "ratio_vs_f32": ratio_f32,
                 "ratio_vs_raw": ratio_raw,
             })
             print(f"  H.265: {total_h265/1024:.1f} KB  "
@@ -918,7 +781,6 @@ def encode_main(args):
                   f"vs raw: {ratio_raw:.1f}x  "
                   f"time: {elapsed:.1f}s")
 
-        # Summary table
         print(f"\n{'='*70}")
         print(f"  {'Preset':<12} {'Size':>10} {'vs f32':>10} {'vs raw':>10} {'Time':>10}")
         print(f"  {'-'*12} {'-'*10} {'-'*10} {'-'*10} {'-'*10}")
@@ -941,38 +803,60 @@ def encode_main(args):
     )
 
     manifest = {
-        "qstep": args.qstep,
         "arch": args.arch,
         "bit_depth": args.bit_depth,
-        "quantized": do_quantize,
         "dither": args.dither,
         "yuv": args.yuv,
-        "reconstruction": (
-            "level = (pixel - max_val/2) / norm_factor + center; weight = level * qstep"
-            if do_quantize else
-            "weight = (pixel - max_val/2) / norm_factor + center"
-        ),
+        "reconstruction": "weight = (pixel - max_val/2) / norm_factor + center",
         "videos": manifest_videos,
     }
 
     print(f"\n--- Summary (preset={args.preset}, {elapsed:.1f}s) ---")
     print(f"Full model DCT weights (float32): {full_model_bytes/1024:.1f} KB")
-    print(f"Quantized frames (int16 raw):     {total_raw_bytes/1024:.1f} KB")
+    print(f"Pixel frames raw:                 {total_raw_bytes/1024:.1f} KB")
     print(f"H.265 encoded:                    {total_h265_bytes/1024:.1f} KB")
     if total_h265_bytes > 0:
         print(f"Compression vs float32:           {full_model_bytes/total_h265_bytes:.1f}x")
-        print(f"Compression vs int16 raw:         {total_raw_bytes/total_h265_bytes:.1f}x")
+        print(f"Compression vs pixel raw:         {total_raw_bytes/total_h265_bytes:.1f}x")
 
     manifest["summary"] = {
         "full_model_float32_bytes": full_model_bytes,
-        "quantized_int16_raw_bytes": total_raw_bytes,
+        "pixel_raw_bytes": total_raw_bytes,
         "h265_encoded_bytes": total_h265_bytes,
     }
+
+    # Save non-DCT weights (BN, FC, 1x1 convs) so the h265 dir is self-contained
+    non_dct_state = {}
+    dct_keys = set()
+    for name, m in model.named_modules():
+        if isinstance(m, DCTConv2d):
+            dct_keys.add(f"{name}.weight_dct")
+            if m.bias is not None:
+                dct_keys.add(f"{name}.bias")
+            # Also exclude IDCT buffers
+            dct_keys.add(f"{name}.C_h_T")
+            dct_keys.add(f"{name}.C_w")
+
+    for k, v in model.state_dict().items():
+        if k not in dct_keys:
+            non_dct_state[k] = v
+
+    non_dct_path = os.path.join(args.output_dir, "non_dct_weights.pt")
+    torch.save(non_dct_state, non_dct_path)
+    non_dct_bytes = os.path.getsize(non_dct_path)
+    total_compressed = total_h265_bytes + non_dct_bytes
+
+    print(f"\nNon-DCT weights:                  {non_dct_bytes/1024:.1f} KB")
+    print(f"Total compressed model:           {total_compressed/1024:.1f} KB")
+    print(f"Total compression ratio:          {(full_model_bytes + non_dct_bytes) / max(total_compressed, 1):.1f}x")
+
+    manifest["summary"]["non_dct_weights_bytes"] = non_dct_bytes
+    manifest["summary"]["total_compressed_bytes"] = total_compressed
 
     manifest_path = os.path.join(args.output_dir, "manifest.json")
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
-    print(f"\nManifest saved to {manifest_path}")
+    print(f"Manifest saved to {manifest_path}")
 
 
 if __name__ == "__main__":
