@@ -208,11 +208,20 @@ def main():
     start_epoch = 0
 
     # ---------- Resume ----------
-    if args.resume:
-        if os.path.isfile(args.resume):
+    # Auto-resume from checkpoint.pth if it exists and --resume not specified
+    resume_path = args.resume
+    if not resume_path:
+        auto_resume = os.path.join(args.output_dir, "checkpoint.pth")
+        if os.path.isfile(auto_resume):
+            resume_path = auto_resume
             if is_main:
-                print(f"=> Loading checkpoint '{args.resume}'")
-            ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+                print(f"=> Found existing checkpoint at {auto_resume}, resuming...")
+
+    if resume_path:
+        if os.path.isfile(resume_path):
+            if is_main:
+                print(f"=> Loading checkpoint '{resume_path}'")
+            ckpt = torch.load(resume_path, map_location=device, weights_only=False)
             start_epoch = ckpt["epoch"]
             model_state = ckpt["state_dict"]
             # Handle DDP state_dict prefix
@@ -224,7 +233,7 @@ def main():
             if is_main:
                 print(f"=> Resumed from epoch {start_epoch}")
         else:
-            raise FileNotFoundError(f"No checkpoint at '{args.resume}'")
+            raise FileNotFoundError(f"No checkpoint at '{resume_path}'")
 
     # ---------- Data ----------
     traindir = os.path.join(args.data, "train")
@@ -293,6 +302,7 @@ def main():
 
     # ---------- Training loop ----------
     best_acc1 = 0.0
+    smallest_est_kb = float("inf")
 
     for epoch in range(start_epoch, args.epochs):
         if distributed:
@@ -322,11 +332,19 @@ def main():
             torch.save(state, path)
             if is_best:
                 torch.save(state, os.path.join(args.output_dir, "best.pth"))
+
             # Estimate H.265 compressed size at 8/10/12-bit
             est_by_depth, raw_bytes = estimate_h265_size_bits(
                 base_model.named_modules(), bit_depths=(8, 10, 12)
             )
             raw_kb = raw_bytes / 1024
+            est_8b_kb = est_by_depth[8] / 8 / 1024
+
+            # Save smallest (by estimated 8-bit H.265 size)
+            is_smallest = est_8b_kb < smallest_est_kb
+            if is_smallest:
+                smallest_est_kb = est_8b_kb
+                torch.save(state, os.path.join(args.output_dir, "smallest.pth"))
 
             est_parts = []
             for b in (8, 10, 12):
@@ -335,9 +353,12 @@ def main():
                 est_parts.append(f"{b}b:{kb:.0f}KB({r:.0f}x)")
             est_str = "  ".join(est_parts)
 
+            best_tag = " *best*" if is_best else ""
+            small_tag = " *smallest*" if is_smallest else ""
             print(f"=> Epoch {epoch}: Acc@1 {acc1:.2f}%  (best: {best_acc1:.2f}%)  "
                   f"Sparsity {sparsity*100:.1f}% ({nonzero}/{total} nonzero)  "
-                  f"Est[{est_str}] / {raw_kb:.0f}KB raw")
+                  f"Est[{est_str}] / {raw_kb:.0f}KB raw"
+                  f"{best_tag}{small_tag}")
 
     # --- Post-training: quantize and export sparse coefficients ---
     if is_main:
