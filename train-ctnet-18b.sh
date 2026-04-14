@@ -13,7 +13,7 @@ echo ""
 
 # Train
 echo "--- Training ---"
-python train_imagenet.py "$DATA_DIR" --arch resnet18 --epochs 256 --pretrained --cache-dataset
+python train_imagenet.py "$DATA_DIR" --arch resnet18 --epochs 256 --lambda-rate 1e-5 --qstep 0.01
 
 # Export to H.265
 echo ""
