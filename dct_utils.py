@@ -116,6 +116,63 @@ def calculate_hevc_rate_proxy(
     return per_coeff_rate.sum()
 
 
+def calculate_hevc_rate_proxy_smooth(
+    weight_dct: torch.Tensor,
+    qstep: float = 1.0,
+    steepness: float = 10.0,
+    smooth_weight: float = 0.5,
+) -> torch.Tensor:
+    """
+    H.265 rate proxy that also rewards spatial smoothness.
+
+    In addition to the per-coefficient sparsity cost, this penalizes
+    differences between adjacent coefficients. H.265's CABAC context
+    model and inter-pixel prediction compress smooth regions much better
+    than noisy ones, even when both are non-sparse.
+
+    The smoothness term models H.265's residual coding: after prediction,
+    the residual is smaller for smooth regions → fewer bits.
+
+    Args:
+        weight_dct: DCT coefficients (2D or 4D)
+        qstep: quantization step
+        steepness: sigmoid steepness for significance
+        smooth_weight: weight for smoothness term relative to sparsity term
+                       (0 = pure sparsity like original, 1 = equal weighting)
+
+    Returns:
+        Scalar estimated rate.
+    """
+    # Sparsity term (same as original)
+    sparsity_rate = calculate_hevc_rate_proxy(weight_dct, qstep, steepness)
+
+    if smooth_weight <= 0:
+        return sparsity_rate
+
+    # Smoothness term: penalize differences between adjacent coefficients
+    # This approximates the residual after H.265's spatial prediction
+    # Smaller differences → smaller residuals → fewer bits
+    if weight_dct.dim() == 2:
+        # Horizontal differences
+        h_diff = (weight_dct[:, 1:] - weight_dct[:, :-1]).abs() / qstep
+        h_cost = torch.log2(1.0 + h_diff).sum()
+        # Vertical differences
+        v_diff = (weight_dct[1:, :] - weight_dct[:-1, :]).abs() / qstep
+        v_cost = torch.log2(1.0 + v_diff).sum()
+        smoothness_cost = h_cost + v_cost
+    elif weight_dct.dim() == 4:
+        # For spatial DCT: differences along kernel dims
+        h_diff = (weight_dct[..., 1:] - weight_dct[..., :-1]).abs() / qstep
+        h_cost = torch.log2(1.0 + h_diff).sum()
+        v_diff = (weight_dct[..., 1:, :] - weight_dct[..., :-1, :]).abs() / qstep
+        v_cost = torch.log2(1.0 + v_diff).sum()
+        smoothness_cost = h_cost + v_cost
+    else:
+        smoothness_cost = torch.tensor(0.0, device=weight_dct.device)
+
+    return sparsity_rate + smooth_weight * smoothness_cost
+
+
 @torch.no_grad()
 def _estimate_2d_image(img: torch.Tensor, bit_depths, results):
     """Estimate H.265 size for a single 2D image (used by estimate_h265_size_bits)."""

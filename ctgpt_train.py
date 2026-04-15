@@ -16,7 +16,7 @@ import torch.nn as nn
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
 
 from ctgpt_model import DCTLinear, _is_dct_layer, replace_linears_with_dct, probe_sparsity, dct_config
-from dct_utils import calculate_hevc_rate_proxy, estimate_h265_size_bits
+from dct_utils import calculate_hevc_rate_proxy, calculate_hevc_rate_proxy_smooth, estimate_h265_size_bits
 
 
 SHAKESPEARE_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
@@ -34,6 +34,8 @@ def parse_args():
                    help="coupled L2: lambda_l2 = alpha * lambda_rate")
     p.add_argument("--qstep", default=0.1, type=float)
     p.add_argument("--steepness", default=10.0, type=float)
+    p.add_argument("--smooth-weight", default=0.5, type=float,
+                   help="weight for smoothness term in rate proxy (0=sparsity only, 0.5=balanced)")
     p.add_argument("--dct-block-size", default=16, type=int)
     p.add_argument("--pixel-bit-depth", default=8, type=int, choices=[0, 8, 10, 12])
     p.add_argument("--rate-warmup-epochs", default=4, type=int)
@@ -214,8 +216,9 @@ def main():
             l2_loss = torch.tensor(0.0, device=device)
             for m in model.modules():
                 if _is_dct_layer(m):
-                    rate_loss = rate_loss + calculate_hevc_rate_proxy(
-                        m.weight_dct, qstep=args.qstep, steepness=args.steepness
+                    rate_loss = rate_loss + calculate_hevc_rate_proxy_smooth(
+                        m.weight_dct, qstep=args.qstep, steepness=args.steepness,
+                        smooth_weight=args.smooth_weight,
                     )
                     if lambda_l2 > 0:
                         l2_loss = l2_loss + m.weight_dct.pow(2).sum()

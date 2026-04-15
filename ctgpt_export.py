@@ -36,6 +36,8 @@ def parse_args():
     enc.add_argument("--bit-depth", default=8, type=int, choices=[8, 10, 12])
     enc.add_argument("--preset", default="slower")
     enc.add_argument("--dither", default=0.0, type=float)
+    enc.add_argument("--sort-frames", action="store_true",
+                     help="sort frames by similarity (slow for large models, O(N²))")
 
     dec = sub.add_parser("decode")
     dec.add_argument("--h265-dir", default="./ctgpt_h265")
@@ -179,7 +181,8 @@ def encode_main(args):
         video_name = f"gpt_{th}x{tw}.hevc"
         video_path = os.path.join(args.output_dir, video_name)
 
-        entries = _sort_by_similarity(entries)
+        if args.sort_frames:
+            entries = _sort_by_similarity(entries)
         frames = [e["frame"] for e in entries]
 
         if args.crf == 0:

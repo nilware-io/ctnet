@@ -1,7 +1,9 @@
 __pycache__/
 .claude/
 .venv/
-checkpoints
-imagenette2-320
+checkpoints/
+ctgpt_checkpoints/
+imagenette2-320/
 h265_*/
 imagenet/
+data/

@@ -9,12 +9,12 @@ echo ""
 
 # Train
 python ctgpt_train.py \
-    --epochs 50 --batch-size 8 --seq-len 256 \
-    --lr 5e-4 --weight-decay 0.001 \
-    --lambda-rate 1e-5 --qstep 0.1 \
+    --epochs 10 --batch-size 8 --seq-len 256 \
+    --lr 2e-5 --weight-decay 0.1 \
+    --lambda-rate 1e-8 --qstep 0.1 \
     --lambda-alpha 0.5 \
     --no-train-noise --dct-dropout 0 \
-    --rate-warmup-epochs 4 \
+    --rate-warmup-epochs 2 \
     --pixel-bit-depth 8 \
     --dct-block-size 16
 

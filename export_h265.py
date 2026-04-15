@@ -61,6 +61,8 @@ def parse_args():
                      help="encode with every preset from ultrafast to veryslow and compare")
     enc.add_argument("--dither", default=0.0, type=float,
                      help="subtractive dither amplitude (0 = off, 0.5 = standard)")
+    enc.add_argument("--sort-frames", action="store_true",
+                     help="sort frames by similarity before encoding (slow for large models)")
     enc.add_argument("--yuv", action="store_true",
                      help="encode as YUV 4:2:0 (Main/Main10 profile) for hardware "
                           "decoder compatibility on phones, Mac, Windows, etc.")
@@ -762,7 +764,8 @@ def _load_model_for_encode(args):
 
 def _encode_tile_groups(tile_groups: dict, output_dir: str, crf: int,
                         preset: str, bit_depth: int, dither: float = 0.0,
-                        yuv: bool = False, verbose: bool = True):
+                        yuv: bool = False, verbose: bool = True,
+                        sort_frames: bool = False):
     """Encode all tile groups to H.265 videos."""
     import time as _time
 
@@ -777,8 +780,8 @@ def _encode_tile_groups(tile_groups: dict, output_dir: str, crf: int,
         use_bit_depth = bit_depth
         video_path = os.path.join(output_dir, video_name)
 
-        # Sort frames by similarity for better inter-frame prediction
-        entries = _sort_by_similarity(entries)
+        if sort_frames:
+            entries = _sort_by_similarity(entries)
 
         frames = [e["frame"] for e in entries]
         raw_bytes = sum(f.size * (use_bit_depth // 8) for f in frames)
@@ -845,7 +848,7 @@ def encode_main(args):
             total_raw, total_h265, _, elapsed = _encode_tile_groups(
                 tile_groups, preset_dir, args.crf, preset, args.bit_depth,
                 dither=args.dither, yuv=args.yuv, verbose=False,
-                bn_crf=args.bn_crf, bn_bit_depth=args.bn_bit_depth,
+                sort_frames=args.sort_frames,
             )
             ratio_f32 = full_model_bytes / max(total_h265, 1)
             ratio_raw = total_raw / max(total_h265, 1)
@@ -878,6 +881,7 @@ def encode_main(args):
     total_raw_bytes, total_h265_bytes, manifest_videos, elapsed = _encode_tile_groups(
         tile_groups, args.output_dir, args.crf, args.preset, args.bit_depth,
         dither=args.dither, yuv=args.yuv,
+        sort_frames=args.sort_frames,
     )
 
     manifest = {

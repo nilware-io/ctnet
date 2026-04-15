@@ -4,7 +4,7 @@ Tests for DCT infrastructure: roundtrip correctness, block DCT, rate proxy, etc.
 
 import torch
 import torch.nn as nn
-from dct_utils import get_1d_dct_matrix, get_dct_matrix, calculate_hevc_rate_proxy, _build_channel_freq_weight
+from dct_utils import get_1d_dct_matrix, get_dct_matrix, calculate_hevc_rate_proxy, calculate_hevc_rate_proxy_smooth, _build_channel_freq_weight
 from dct_layers import DCTConv2d, ChannelDCTConv1x1, replace_with_dct_convs, _is_dct_layer
 
 
@@ -157,6 +157,32 @@ def test_rate_proxy_4d():
     print(f"PASS: Rate proxy on 4D tensor (rate={rate.item():.0f})")
 
 
+def test_smooth_rate_proxy():
+    """Smooth rate proxy should prefer smooth signals over noisy ones."""
+    # Smooth signal: all similar values
+    smooth = torch.ones(64, 128) * 0.5
+    smooth += torch.randn(64, 128) * 0.01  # tiny variation
+
+    # Noisy signal: same magnitude but random
+    noisy = torch.randn(64, 128) * 0.5
+
+    rate_smooth = calculate_hevc_rate_proxy_smooth(smooth, qstep=0.1, smooth_weight=0.5)
+    rate_noisy = calculate_hevc_rate_proxy_smooth(noisy, qstep=0.1, smooth_weight=0.5)
+
+    # Smooth should have lower rate than noisy (both have same average magnitude)
+    assert rate_smooth < rate_noisy, (
+        f"Smooth rate ({rate_smooth:.0f}) should be less than noisy rate ({rate_noisy:.0f})"
+    )
+
+    # With smooth_weight=0, should match original proxy
+    rate_no_smooth = calculate_hevc_rate_proxy_smooth(noisy, qstep=0.1, smooth_weight=0.0)
+    rate_original = calculate_hevc_rate_proxy(noisy, qstep=0.1)
+    assert abs(rate_no_smooth.item() - rate_original.item()) < 1e-3, \
+        "smooth_weight=0 should match original proxy"
+
+    print(f"PASS: Smooth rate proxy (smooth={rate_smooth:.0f} < noisy={rate_noisy:.0f})")
+
+
 def test_channel_freq_weight():
     """Channel frequency weights should be in [1, 3] range."""
     for H, W in [(8, 8), (64, 128), (768, 2304)]:
@@ -178,5 +204,6 @@ if __name__ == "__main__":
     test_dct_linear_roundtrip()
     test_rate_proxy_2d()
     test_rate_proxy_4d()
+    test_smooth_rate_proxy()
     test_channel_freq_weight()
     print("\n=== ALL TESTS PASSED ===")
