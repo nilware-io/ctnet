@@ -4,3 +4,4 @@ __pycache__/
 checkpoints
 imagenette2-320
 h265_*/
+imagenet/
